@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from ultralytics import YOLO
 from datetime import datetime, timedelta
 
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer+ignidx+igndts|analyzeduration;0|timeout;5000000"
+
 load_dotenv()
 
 app = FastAPI(title="Green Tech Edge API")
@@ -31,11 +33,20 @@ app.add_middleware(
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
-ESP32_URL = "http://esp32.local:7070"
+ESP32_URL = "http://192.168.1.3:7070"
+ESP32_SENSOR_URL = f"{ESP32_URL}/data"
 
 # Telegram Secrets
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+import socket
+
+print("="*50)
+print(f"🌍 STATIC NETWORK ACCESS URLS:")
+print(f"💻 Frontend (React): http://192.168.1.10:5173")
+print(f"⚙️ Backend (API):    http://192.168.1.10:8000")
+print("="*50)
 
 async def send_telegram(message: str, image_frame=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -116,6 +127,60 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# --- Mobile Node Setup ---
+MOBILE_DB_PATH = "mobile_nodes.db"
+MOBILE_NODE_URL = "http://192.168.1.4:7070/data"
+
+def init_mobile_db():
+    conn = sqlite3.connect(MOBILE_DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            m1 INTEGER,
+            m2 INTEGER,
+            m3 INTEGER,
+            m4 INTEGER,
+            temp REAL,
+            pressure REAL,
+            lat REAL,
+            lon REAL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_mobile_db()
+
+last_mobile_data_str = ""
+
+async def poll_mobile_node():
+    global last_mobile_data_str
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                resp = await client.get(MOBILE_NODE_URL)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_data_str = json.dumps(data, sort_keys=True)
+                    if new_data_str != last_mobile_data_str:
+                        last_mobile_data_str = new_data_str
+                        ts_str = datetime.utcnow().isoformat()
+                        conn = sqlite3.connect(MOBILE_DB_PATH)
+                        c = conn.cursor()
+                        c.execute(
+                            "INSERT INTO readings (timestamp, m1, m2, m3, m4, temp, pressure, lat, lon) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (ts_str, data.get("m1",0), data.get("m2",0), data.get("m3",0), data.get("m4",0), data.get("temp",0.0), data.get("pressure",0.0), data.get("lat",0.0), data.get("lon",0.0))
+                        )
+                        conn.commit()
+                        conn.close()
+            except httpx.RequestError as e:
+                pass
+            except Exception as e:
+                pass
+            await asyncio.sleep(5.0)
+
 @app.websocket("/ws/alerts")
 async def websocket_alerts(websocket: WebSocket):
     await manager.connect(websocket)
@@ -131,6 +196,7 @@ async def startup_event():
     global global_ws_loop
     global_ws_loop = asyncio.get_event_loop()
     asyncio.create_task(edge_polling_loop())
+    asyncio.create_task(poll_mobile_node())
 
 def send_alert_sync(message: str):
     if global_ws_loop and not global_ws_loop.is_closed():
@@ -142,7 +208,7 @@ async def edge_polling_loop():
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             try:
-                resp = await client.get(f"{ESP32_URL}/data")
+                resp = await client.get(ESP32_SENSOR_URL)
                 if resp.status_code == 200:
                     data = resp.json()
                     temp = data.get("temp", 0)
@@ -173,14 +239,17 @@ async def edge_polling_loop():
                         await manager.broadcast("FIRE_SAFE")
                         asyncio.create_task(send_telegram("✅ Fire safely extinguished."))
 
+            except httpx.RequestError as e:
+                print(f"[EDGE WARNING] Failed to connect to Sensor Board: {e}")
+                # Pass zero arrays softly ensuring local graph data continues printing empty rows
             except Exception as e:
-                # Silently catch offline edge events
                 pass
+                
             await asyncio.sleep(5.0)
 
 # --- Global Frame & Inference ---
 latest_clean_frame = None
-latest_annotated_frame = None
+global_latest_frame = None
 frame_lock = threading.Lock()
 
 try:
@@ -195,127 +264,160 @@ safe_start_time = None
 safe_last_seen = None
 
 def video_processor_loop():
-    global latest_clean_frame, latest_annotated_frame, current_state
+    global latest_clean_frame, current_state, global_latest_frame
     global threat_start_time, threat_last_seen, safe_start_time, safe_last_seen
-    
-    stream_url = "http://esp32cam.local:81/stream"
-    print(f"Attempting to connect to ESP32-CAM at {stream_url}...")
-    cap = cv2.VideoCapture(stream_url)
-    
-    if not cap.isOpened():
-        print("⚠️ ESP32-CAM not found or mDNS resolution failed. Falling back to local webcam (0).")
+
+    stream_url = "http://192.168.1.2:81/stream"
+
+    # FORCE 5-SECOND INITIAL CONNECTION RETRY LOOP
+    cap = None
+    start_time = time.time()
+    print(f"Attempting initial connection to ESP32-CAM at {stream_url}...")
+    while time.time() - start_time < 5.0:
+        cap = cv2.VideoCapture(stream_url)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # CRITICAL: discard stale buffered frames
+            print("✅ Successfully connected to ESP32-CAM!")
+            break
+        print("⏳ Connection refused or delayed, retrying...")
+        if cap:
+            cap.release()
+        time.sleep(0.5)
+
+    # FALLBACK LOGIC AFTER 5 SECONDS
+    if not cap or not cap.isOpened():
+        print("⚠️ 5 Seconds elapsed. ESP32-CAM unreachable. Falling back to local webcam (0).")
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("❌ CRITICAL: No camera sources available.")
             return
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     print("✅ Video stream connected successfully.")
-        
+
     frame_count = 0
     last_annotated = None
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(1)
-            print(f"Attempting to reconnect to stream...")
-            cap = cv2.VideoCapture(stream_url)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)
-            continue
-            
-        frame_count += 1
-        clean_frame = frame.copy()
-        current_time = time.time()
-        annotated_frame = frame.copy()
-        
-        if frame_count % 3 == 0 and model is not None:
-            results = model(clean_frame, conf=0.5, verbose=False)
-            annotated_frame = results[0].plot()
-            last_annotated = annotated_frame 
-            
-            classes = results[0].boxes.cls.tolist()
-            names = model.names
-            
-            anomaly_detected = False
-            for c_id in classes:
-                if names[int(c_id)] != 'potted plant':
-                    anomaly_detected = True
-                    break
-                    
-            if current_state == 0:
-                if anomaly_detected:
-                    threat_last_seen = current_time
-                    if threat_start_time is None:
-                        threat_start_time = current_time
+
+    while True:  # MASTER RECONNECT LOOP — keeps thread alive forever
+        print("[OpenCV] Inner frame-loop starting on active cap...")
+
+        while True:  # FRAME READING LOOP
+            success, frame = cap.read()
+            if not success:
+                print("⚠️ Frame drop or overread detected. Destroying and restarting connection...")
+                cap.release()
+                break  # Break to master loop to fully re-init cap
+
+            frame_count += 1
+            clean_frame = frame.copy()
+            current_time = time.time()
+            annotated_frame = frame.copy()
+
+            if frame_count % 3 == 0 and model is not None:
+                results = model.predict(clean_frame, imgsz=320, conf=0.5, verbose=False)
+                annotated_frame = results[0].plot()
+                last_annotated = annotated_frame
+
+                classes = results[0].boxes.cls.tolist()
+                names = model.names
+
+                anomaly_detected = False
+                for c_id in classes:
+                    if names[int(c_id)] != 'potted plant':
+                        anomaly_detected = True
+                        break
+
+                if current_state == 0:
+                    if anomaly_detected:
+                        threat_last_seen = current_time
+                        if threat_start_time is None:
+                            threat_start_time = current_time
+                        else:
+                            if current_time - threat_start_time >= 3.0:
+                                current_state = 1
+                                threat_start_time = None
+                                threat_last_seen = None
+                                send_alert_sync("INTRUDER_ALERT")
+                                _, ann_buf = cv2.imencode('.jpg', annotated_frame)
+                                if global_ws_loop and not global_ws_loop.is_closed():
+                                    asyncio.run_coroutine_threadsafe(
+                                        send_telegram("🚨 INTRUDER DETECTED!", ann_buf.tobytes()),
+                                        global_ws_loop
+                                    )
                     else:
-                        if current_time - threat_start_time >= 3.0:
-                            current_state = 1
+                        if threat_last_seen is not None and (current_time - threat_last_seen > 1.0):
                             threat_start_time = None
                             threat_last_seen = None
-                            
-                            # Transmit payload concurrently
-                            send_alert_sync("INTRUDER_ALERT")
-                            
-                            _, annotated_buffer = cv2.imencode('.jpg', annotated_frame)
-                            if global_ws_loop and not global_ws_loop.is_closed():
-                                asyncio.run_coroutine_threadsafe(
-                                    send_telegram("🚨 INTRUDER DETECTED!", annotated_buffer.tobytes()), 
-                                    global_ws_loop
-                                )
-                else:
-                    if threat_last_seen is not None and (current_time - threat_last_seen > 1.0):
-                        threat_start_time = None
-                        threat_last_seen = None
-                        
-            elif current_state == 1:
-                if not anomaly_detected:
-                    safe_last_seen = current_time
-                    if safe_start_time is None:
-                        safe_start_time = current_time
+
+                elif current_state == 1:
+                    if not anomaly_detected:
+                        safe_last_seen = current_time
+                        if safe_start_time is None:
+                            safe_start_time = current_time
+                        else:
+                            if current_time - safe_start_time >= 3.0:
+                                current_state = 0
+                                safe_start_time = None
+                                safe_last_seen = None
+                                send_alert_sync("INTRUDER_SAFE")
+                                if global_ws_loop and not global_ws_loop.is_closed():
+                                    asyncio.run_coroutine_threadsafe(
+                                        send_telegram("✅ Area clear.", None),
+                                        global_ws_loop
+                                    )
                     else:
-                        if current_time - safe_start_time >= 3.0:
-                            current_state = 0
+                        if safe_last_seen is not None and (current_time - safe_last_seen > 1.0):
                             safe_start_time = None
                             safe_last_seen = None
-                            
-                            send_alert_sync("INTRUDER_SAFE")
-                            if global_ws_loop and not global_ws_loop.is_closed():
-                                asyncio.run_coroutine_threadsafe(
-                                    send_telegram("✅ Area clear.", None), 
-                                    global_ws_loop
-                                )
-                else:
-                    if safe_last_seen is not None and (current_time - safe_last_seen > 1.0):
-                        safe_start_time = None
-                        safe_last_seen = None
-        else:
-            if last_annotated is not None:
-                annotated_frame = last_annotated
+            else:
+                if last_annotated is not None:
+                    annotated_frame = last_annotated
 
-        state_str = "STATE: 1 (ALERT)" if current_state == 1 else "STATE: 0 (SAFE)"
-        color = (0, 0, 255) if current_state == 1 else (0, 255, 0)
-        cv2.putText(annotated_frame, state_str, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        
-        analyzing_str = ""
-        if current_state == 0 and threat_start_time is not None:
-            elapsed = current_time - threat_start_time
-            analyzing_str = f"ANALYZING: Threat detected {elapsed:.1f}s"
-        elif current_state == 1 and safe_start_time is not None:
-            elapsed = current_time - safe_start_time
-            analyzing_str = f"ANALYZING: Safe verification {elapsed:.1f}s"
-            
-        if analyzing_str:
-            cv2.putText(annotated_frame, analyzing_str, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            # Dynamic proportional overlay scaling
+            h, w = frame.shape[:2]
+            scale_factor = w / 1280.0
+            dynamic_font_scale = max(0.4, 1.0 * scale_factor)
+            dynamic_thickness = max(1, int(2 * scale_factor))
+            margin_x = max(10, int(30 * scale_factor))
+            margin_y = max(20, int(40 * scale_factor))
+            line_spacing = max(15, int(35 * scale_factor))
 
-        _, clean_buffer = cv2.imencode('.jpg', clean_frame)
-        _, annotated_buffer = cv2.imencode('.jpg', annotated_frame)
-        
-        with frame_lock:
-            latest_clean_frame = clean_buffer.tobytes()
-            latest_annotated_frame = annotated_buffer.tobytes()
-            
-        time.sleep(0.01)
+            state_str = "STATE: 1 (ALERT)" if current_state == 1 else "STATE: 0 (SAFE)"
+            color = (0, 0, 255) if current_state == 1 else (0, 255, 0)
+            cv2.putText(annotated_frame, state_str, (margin_x, margin_y), cv2.FONT_HERSHEY_SIMPLEX, dynamic_font_scale, color, dynamic_thickness)
+
+            analyzing_str = ""
+            if current_state == 0 and threat_start_time is not None:
+                elapsed = current_time - threat_start_time
+                analyzing_str = f"ANALYZING: Threat detected {elapsed:.1f}s"
+            elif current_state == 1 and safe_start_time is not None:
+                elapsed = current_time - safe_start_time
+                analyzing_str = f"ANALYZING: Safe verification {elapsed:.1f}s"
+
+            if analyzing_str:
+                cv2.putText(annotated_frame, analyzing_str, (margin_x, margin_y + line_spacing), cv2.FONT_HERSHEY_SIMPLEX, dynamic_font_scale * 0.8, (0, 255, 255), dynamic_thickness)
+
+            # Save clean frame for AI chat
+            _, clean_buffer = cv2.imencode('.jpg', clean_frame)
+            with frame_lock:
+                latest_clean_frame = clean_buffer.tobytes()
+
+            # Encode final annotated frame once → write to global buffer (thread-safe)
+            ret_enc, ann_buffer = cv2.imencode('.jpg', annotated_frame)
+            if ret_enc:
+                with frame_lock:
+                    global_latest_frame = ann_buffer.tobytes()
+
+            time.sleep(0.01)
+
+        # Master loop: destroy poisoned cap and fully re-init
+        print("[OpenCV] Re-initializing VideoCapture after connection drop...")
+        time.sleep(2)
+        cap = cv2.VideoCapture(stream_url)
+        if not cap.isOpened():
+            print("⚠️ ESP32-CAM still unreachable. Retrying webcam fallback...")
+            cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Always flush buffer on reconnect
 
 threading.Thread(target=video_processor_loop, daemon=True).start()
 
@@ -410,18 +512,34 @@ async def get_sensor_history_single(feed_name: str):
          return data[feed_name]
     return []
 
-def generate_mjpeg():
+@app.get("/api/mobile/latest")
+async def get_mobile_latest():
+    conn = sqlite3.connect(MOBILE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM readings ORDER BY id DESC LIMIT 10")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(ix) for ix in rows]
+
+global_latest_frame = None
+
+async def generate_frames():
+    global global_latest_frame
     while True:
         with frame_lock:
-            frame = latest_annotated_frame
-        if frame is not None:
-            yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        else:
-            time.sleep(0.1)
+            current_frame = global_latest_frame
+
+        if current_frame is not None:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + current_frame + b'\r\n')
+
+        # Cap the output to ~30 FPS to prevent flooding the local network
+        await asyncio.sleep(0.03)
 
 @app.get("/api/video_feed")
 async def video_feed():
-    return StreamingResponse(generate_mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 # --- AI Chat Engine ---
 class ChatMessage(BaseModel):
