@@ -158,6 +158,7 @@ npm run dev
 ---
 
 ## Project Structure
+```
 agro-guard/
 ├── backend/
 │   └── main.py               # FastAPI app, YOLOv8, sensor polling, AI chat
@@ -178,6 +179,7 @@ agro-guard/
 │       └── assets/           # Icons, animations, sounds
 ├── run.sh                    # One-shot startup script
 └── README.md
+```
 
 ---
 
